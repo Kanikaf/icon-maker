@@ -112,6 +112,11 @@
   button:disabled { opacity: .45; cursor: not-allowed; }
   button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
+  .hint { margin: 6px 0 0; font-size: .82rem; color: var(--ink-soft); }
+  .check { display: flex; gap: 8px; align-items: center; font-size: .92rem; font-weight: 500; cursor: pointer; }
+  .check input { width: 18px; height: 18px; accent-color: var(--accent); }
+  button.small { padding: 6px 12px; font-weight: 500; font-size: .9rem; }
+  .stage.painting canvas { cursor: crosshair; touch-action: none; }
   footer { margin-top: 40px; font-size: .8rem; color: var(--ink-soft); max-width: 70ch; }
   footer a { color: inherit; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
@@ -138,12 +143,28 @@
 
       <div class="controls">
         <div class="row">
-          <label class="title">切り抜きの精度</label>
+          <label class="title">切り抜き方法</label>
+          <div class="seg" role="radiogroup">
+            <input type="radio" name="method" id="me-ai" value="ai" checked><label for="me-ai">AIで自動（写真向け）</label>
+            <input type="radio" name="method" id="me-flat" value="flat"><label for="me-flat">外側の背景色を消す（イラスト向け）</label>
+          </div>
+          <p class="hint" id="methodHint">人物・製品などの写真に向いています。</p>
+        </div>
+        <div class="row" id="modelRow">
+          <label class="title">AIの精度</label>
           <div class="seg" role="radiogroup">
             <input type="radio" name="model" id="m-std" value="isnet_fp16" checked><label for="m-std">標準</label>
             <input type="radio" name="model" id="m-hi" value="isnet"><label for="m-hi">高精度（重い）</label>
             <input type="radio" name="model" id="m-lite" value="isnet_quint8"><label for="m-lite">軽量</label>
           </div>
+        </div>
+        <div class="row" id="tolRow" hidden>
+          <label class="title" for="tol">背景とみなす色の幅 <span class="val" id="tolVal">30</span></label>
+          <input id="tol" type="range" min="0" max="100" value="30">
+        </div>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="fillHoles"> 輪郭で囲まれた内側は消さない</label>
+          <p class="hint">白い塗りのキャラが一緒に消えてしまうときにオンにしてください。</p>
         </div>
       </div>
 
@@ -165,6 +186,21 @@
 
       <div class="controls">
         <div class="row">
+          <label class="title">手直し（プレビューを直接なぞる）</label>
+          <div class="inline">
+            <div class="seg" role="radiogroup">
+              <input type="radio" name="tool" id="t-none" value="none" checked><label for="t-none">なし</label>
+              <input type="radio" name="tool" id="t-keep" value="keep"><label for="t-keep">残すブラシ</label>
+              <input type="radio" name="tool" id="t-erase" value="erase"><label for="t-erase">消すブラシ</label>
+            </div>
+            <button id="undo" type="button" class="small" disabled>1つ戻す</button>
+          </div>
+        </div>
+        <div class="row" id="brushRow" hidden>
+          <label class="title" for="brush">ブラシの太さ <span class="val" id="brushVal">24</span></label>
+          <input id="brush" type="range" min="4" max="80" value="24">
+        </div>
+        <div class="row">
           <label class="title" for="pad">余白 <span class="val" id="padVal">8%</span></label>
           <input id="pad" type="range" min="0" max="30" value="8">
         </div>
@@ -183,6 +219,13 @@
               <input type="radio" name="bg" id="bg-color" value="color"><label for="bg-color">色をつける</label>
             </div>
             <input id="bgColor" type="color" value="#ffffff" aria-label="背景色">
+          </div>
+        </div>
+        <div class="row" id="matteRow">
+          <label class="title" for="matteColor">透明が効かないアプリでの背景色</label>
+          <div class="inline">
+            <input id="matteColor" type="color" value="#ffffff">
+            <span class="val">Android版のゲームなどで背景が黒くなる場合、この色で表示されます（透明に対応したアプリでは透明のままです）</span>
           </div>
         </div>
         <div class="row">
@@ -214,15 +257,20 @@
 
   const $ = (id) => document.getElementById(id);
   const drop = $("drop"), fileInput = $("file"), statusEl = $("status"), bar = $("bar"), barFill = bar.querySelector("span");
-  const preview = $("preview"), emptyEl = $("empty"), dlBtn = $("dl"), resetBtn = $("reset");
+  const preview = $("preview"), stage = preview.parentElement, emptyEl = $("empty"), dlBtn = $("dl"), resetBtn = $("reset");
   const padInput = $("pad"), padVal = $("padVal"), bgColor = $("bgColor");
+  const tolInput = $("tol"), tolVal = $("tolVal"), fillHoles = $("fillHoles");
+  const brushInput = $("brush"), brushVal = $("brushVal"), undoBtn = $("undo");
 
-  const MAX_INPUT = 2000;     // 大きすぎる写真はここまで縮小してから処理
+  const MAX_INPUT = 2000;     // 大きすぎる画像はここまで縮小してから処理
   const ALPHA_CUT = 12;       // これより薄いピクセルは「何もない」とみなす
-  let cutout = null;          // 背景を消した画像（canvas）
+  let original = null;        // 元画像（縮小後, canvas）
+  let aiCache = null;         // AIの切り抜き結果（設定変更で再利用）
+  let cutout = null;          // 現在の切り抜き結果（canvas）
   let bounds = null;          // 被写体の範囲 {x,y,w,h}
   let baseName = "icon";
   let busy = false;
+  let undoStack = [];
 
   const radio = (name) => document.querySelector(`input[name="${name}"]:checked`).value;
   const setStatus = (msg, isError = false) => { statusEl.textContent = msg; statusEl.classList.toggle("error", isError); };
@@ -230,11 +278,12 @@
     if (ratio == null) { bar.classList.remove("on"); return; }
     bar.classList.add("on"); barFill.style.width = `${Math.round(ratio * 100)}%`;
   };
+  const newCanvas = (w, h) => { const c = document.createElement("canvas"); c.width = w; c.height = h; return c; };
 
   // ---- 入力 ----
   drop.addEventListener("click", () => !busy && fileInput.click());
   drop.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && !busy) { e.preventDefault(); fileInput.click(); } });
-  fileInput.addEventListener("change", () => fileInput.files[0] && handleFile(fileInput.files[0]));
+  fileInput.addEventListener("change", () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); fileInput.value = ""; });
   ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
   ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
   drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) handleFile(f); });
@@ -247,53 +296,16 @@
   async function handleFile(file) {
     if (busy) return;
     if (!file.type.startsWith("image/")) { setStatus("画像ファイル（PNG / JPG / WebP）を選んでください。", true); return; }
-    busy = true; dlBtn.disabled = true; resetBtn.disabled = true;
     baseName = (file.name || "icon").replace(/\.[^.]+$/, "") || "icon";
-
     const url = URL.createObjectURL(file);
     drop.innerHTML = `<img src="${url}" alt="元の画像">`;
-
     try {
-      const img = await loadImage(url);
-      const input = await shrink(img);
-      setStatus("背景を切り抜いています…");
-      setProgress(0);
-
-      const blob = await removeBackground(input, {
-        model: radio("model"),
-        output: { format: "image/png" },
-        progress: (key, current, total) => {
-          if (key.startsWith("fetch:")) {
-            setStatus("切り抜き用データを読み込んでいます（初回のみ）…");
-            setProgress(total ? current / total : 0);
-          } else if (key.startsWith("compute:")) {
-            setStatus("背景を切り抜いています…");
-            setProgress(total ? current / total : null);
-          }
-        },
-      });
-
-      const outImg = await loadImage(URL.createObjectURL(blob));
-      cutout = document.createElement("canvas");
-      cutout.width = outImg.naturalWidth; cutout.height = outImg.naturalHeight;
-      cutout.getContext("2d").drawImage(outImg, 0, 0);
-      bounds = findBounds(cutout);
-
-      if (!bounds) {
-        cutout = null;
-        setStatus("被写体が見つかりませんでした。被写体がはっきり写った画像で試してください。", true);
-      } else {
-        setStatus("できました。余白や形を調整して保存してください。");
-        render();
-      }
+      original = shrink(await loadImage(url));
+      aiCache = null;
+      await rebuild();
     } catch (err) {
       console.error(err);
-      setStatus("切り抜きに失敗しました。ページを再読み込みするか、「軽量」を選んでもう一度試してください。", true);
-    } finally {
-      setProgress(null);
-      busy = false;
-      resetBtn.disabled = false;
-      dlBtn.disabled = !cutout;
+      setStatus("画像を読み込めませんでした。別の画像で試してください。", true);
     }
   }
 
@@ -306,17 +318,153 @@
     });
   }
 
-  // 大きい写真は縮小してから渡す（処理を速くするため）
   function shrink(img) {
     const scale = Math.min(1, MAX_INPUT / Math.max(img.naturalWidth, img.naturalHeight));
-    const c = document.createElement("canvas");
-    c.width = Math.round(img.naturalWidth * scale);
-    c.height = Math.round(img.naturalHeight * scale);
+    const c = newCanvas(Math.round(img.naturalWidth * scale), Math.round(img.naturalHeight * scale));
     c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-    return new Promise((resolve) => c.toBlob(resolve, "image/png"));
+    return c;
   }
 
-  // 透明でない部分の外枠を求める
+  // ---- 切り抜きの作り直し（方法・設定を変えたとき） ----
+  async function rebuild() {
+    if (!original || busy) return;
+    busy = true; dlBtn.disabled = true; resetBtn.disabled = true;
+    try {
+      let result;
+      if (radio("method") === "ai") {
+        if (!aiCache) aiCache = await runAI();
+        result = newCanvas(aiCache.width, aiCache.height);
+        result.getContext("2d").drawImage(aiCache, 0, 0);
+      } else {
+        result = flatBackgroundCut(original, Number(tolInput.value));
+      }
+      if (fillHoles.checked) keepEnclosed(result);
+
+      const b = findBounds(result);
+      if (!b) {
+        cutout = null; bounds = null;
+        setStatus("被写体が見つかりませんでした。切り抜き方法や設定を変えて試してください。", true);
+      } else {
+        cutout = result; bounds = b;
+        setStatus("できました。消えすぎ・残りすぎの部分は「手直し」のブラシで直せます。");
+      }
+      undoStack = []; undoBtn.disabled = true;
+      render();
+    } catch (err) {
+      console.error(err);
+      setStatus("切り抜きに失敗しました。ページを再読み込みするか、「軽量」を選んでもう一度試してください。", true);
+    } finally {
+      setProgress(null);
+      busy = false;
+      resetBtn.disabled = !original;
+      dlBtn.disabled = !cutout;
+    }
+  }
+
+  async function runAI() {
+    setStatus("背景を切り抜いています…");
+    setProgress(0);
+    const input = await new Promise((r) => original.toBlob(r, "image/png"));
+    const blob = await removeBackground(input, {
+      model: radio("model"),
+      output: { format: "image/png" },
+      progress: (key, current, total) => {
+        if (key.startsWith("fetch:")) setStatus("切り抜き用データを読み込んでいます（初回のみ）…");
+        else setStatus("背景を切り抜いています…");
+        setProgress(total ? current / total : null);
+      },
+    });
+    const img = await loadImage(URL.createObjectURL(blob));
+    const c = newCanvas(original.width, original.height);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  // ---- イラスト向け：画像の外周とつながっている背景色だけを消す ----
+  // 線で囲まれた内側は外周とつながらないので、背景と同じ色でも残る
+  function flatBackgroundCut(src, tolSetting) {
+    const w = src.width, h = src.height;
+    const out = newCanvas(w, h);
+    const ctx = out.getContext("2d");
+    ctx.drawImage(src, 0, 0);
+    const img = ctx.getImageData(0, 0, w, h), d = img.data;
+
+    // 外周のピクセルで一番多い色を背景色とする
+    const counts = new Map();
+    const borderIdx = [];
+    for (let x = 0; x < w; x++) { borderIdx.push(x, (h - 1) * w + x); }
+    for (let y = 1; y < h - 1; y++) { borderIdx.push(y * w, y * w + w - 1); }
+    for (const p of borderIdx) {
+      const i = p * 4;
+      const key = (d[i] >> 4) << 8 | (d[i + 1] >> 4) << 4 | (d[i + 2] >> 4);
+      const e = counts.get(key) || { n: 0, r: 0, g: 0, b: 0 };
+      e.n++; e.r += d[i]; e.g += d[i + 1]; e.b += d[i + 2];
+      counts.set(key, e);
+    }
+    let best = null;
+    for (const e of counts.values()) if (!best || e.n > best.n) best = e;
+    const br = best.r / best.n, bg = best.g / best.n, bb = best.b / best.n;
+
+    const tol = tolSetting * 1.2;            // 0〜120（RGB距離）
+    const soft = tol + 40;                   // ふち（なめらかにする範囲）
+    const dist = (p) => {
+      const i = p * 4;
+      if (d[i + 3] < ALPHA_CUT) return 0;   // もともと透明なピクセルは背景扱い
+      const dr = d[i] - br, dg = d[i + 1] - bg, db = d[i + 2] - bb;
+      return Math.sqrt(dr * dr + dg * dg + db * db);
+    };
+
+    const removed = new Uint8Array(w * h);
+    const queue = new Int32Array(w * h);
+    let head = 0, tail = 0;
+    for (const p of borderIdx) if (!removed[p] && dist(p) <= tol) { removed[p] = 1; queue[tail++] = p; }
+    while (head < tail) {
+      const p = queue[head++], x = p % w, y = (p / w) | 0;
+      const nb = [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y > 0 ? p - w : -1, y < h - 1 ? p + w : -1];
+      for (const q of nb) if (q >= 0 && !removed[q] && dist(q) <= tol) { removed[q] = 1; queue[tail++] = q; }
+    }
+
+    for (let p = 0; p < w * h; p++) {
+      if (removed[p]) { d[p * 4 + 3] = 0; continue; }
+      // 消した部分に接するふちは、背景色に近いほど薄くしてギザギザを抑える
+      const x = p % w, y = (p / w) | 0;
+      const touches = (x > 0 && removed[p - 1]) || (x < w - 1 && removed[p + 1]) || (y > 0 && removed[p - w]) || (y < h - 1 && removed[p + w]);
+      if (touches) {
+        const k = (dist(p) - tol) / (soft - tol);
+        if (k < 1) d[p * 4 + 3] = Math.round(d[p * 4 + 3] * Math.max(0.15, k));
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return out;
+  }
+
+  // ---- 外周とつながっていない透明部分（輪郭で囲まれた内側）を元画像で埋め戻す ----
+  function keepEnclosed(canvas) {
+    const w = canvas.width, h = canvas.height;
+    const ctx = canvas.getContext("2d");
+    const img = ctx.getImageData(0, 0, w, h), d = img.data;
+    const src = original.getContext("2d").getImageData(0, 0, w, h).data;
+    const clear = (p) => d[p * 4 + 3] <= ALPHA_CUT;
+    const outside = new Uint8Array(w * h);
+    const queue = new Int32Array(w * h);
+    let head = 0, tail = 0;
+    const seed = (p) => { if (!outside[p] && clear(p)) { outside[p] = 1; queue[tail++] = p; } };
+    for (let x = 0; x < w; x++) { seed(x); seed((h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { seed(y * w); seed(y * w + w - 1); }
+    while (head < tail) {
+      const p = queue[head++], x = p % w, y = (p / w) | 0;
+      if (x > 0) seed(p - 1); if (x < w - 1) seed(p + 1);
+      if (y > 0) seed(p - w); if (y < h - 1) seed(p + w);
+    }
+    for (let p = 0; p < w * h; p++) {
+      if (!outside[p] && d[p * 4 + 3] < 255) {
+        const i = p * 4;
+        d[i] = src[i]; d[i + 1] = src[i + 1]; d[i + 2] = src[i + 2]; d[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
   function findBounds(canvas) {
     const { width: w, height: h } = canvas;
     const data = canvas.getContext("2d").getImageData(0, 0, w, h).data;
@@ -333,34 +481,34 @@
   }
 
   // ---- 正方形アイコンを描く ----
+  function layout(size) {
+    const pad = Number(padInput.value) / 100;
+    const scale = size * (1 - pad * 2) / Math.max(bounds.w, bounds.h);
+    return { scale, offX: (size - bounds.w * scale) / 2, offY: (size - bounds.h * scale) / 2 };
+  }
+
   function drawIcon(target, size) {
     const ctx = target.getContext("2d");
     ctx.clearRect(0, 0, size, size);
     if (!cutout) return;
-
-    const pad = Number(padInput.value) / 100;
-    const circle = radio("shape") === "circle";
-    const fill = radio("bg") === "color";
-
     ctx.save();
-    if (circle) {
+    if (radio("shape") === "circle") {
       ctx.beginPath();
       ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
       ctx.clip();
     }
-    if (fill) { ctx.fillStyle = bgColor.value; ctx.fillRect(0, 0, size, size); }
-
-    const inner = size * (1 - pad * 2);
-    const scale = inner / Math.max(bounds.w, bounds.h);
-    const dw = bounds.w * scale, dh = bounds.h * scale;
+    if (radio("bg") === "color") { ctx.fillStyle = bgColor.value; ctx.fillRect(0, 0, size, size); }
+    const { scale, offX, offY } = layout(size);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(cutout, bounds.x, bounds.y, bounds.w, bounds.h, (size - dw) / 2, (size - dh) / 2, dw, dh);
+    ctx.drawImage(cutout, bounds.x, bounds.y, bounds.w, bounds.h, offX, offY, bounds.w * scale, bounds.h * scale);
     ctx.restore();
   }
 
   function render() {
     padVal.textContent = `${padInput.value}%`;
+    tolVal.textContent = tolInput.value;
+    brushVal.textContent = brushInput.value;
     emptyEl.hidden = !!cutout;
     $("sizes").hidden = !cutout;
     drawIcon(preview, preview.width);
@@ -368,27 +516,184 @@
     drawIcon($("s32"), 32);
   }
 
+  // ---- 設定の変更 ----
+  const updateMethodUI = () => {
+    const ai = radio("method") === "ai";
+    $("modelRow").hidden = !ai;
+    $("tolRow").hidden = ai;
+    $("methodHint").textContent = ai
+      ? "人物・製品などの写真に向いています。"
+      : "単色の背景のイラストに向いています。キャラの輪郭線の内側は、背景と同じ色でも消えません。";
+  };
+  document.querySelectorAll('input[name="method"]').forEach((el) => el.addEventListener("change", () => {
+    updateMethodUI();
+    rebuild();
+  }));
+  document.querySelectorAll('input[name="model"]').forEach((el) => el.addEventListener("change", () => { aiCache = null; rebuild(); }));
+  fillHoles.addEventListener("change", rebuild);
+  let tolTimer;
+  tolInput.addEventListener("input", () => {
+    tolVal.textContent = tolInput.value;
+    clearTimeout(tolTimer);
+    tolTimer = setTimeout(rebuild, 200);
+  });
+
   [padInput, bgColor].forEach((el) => el.addEventListener("input", () => {
     if (el === bgColor) $("bg-color").checked = true;
     render();
   }));
   document.querySelectorAll('input[name="shape"], input[name="bg"]').forEach((el) => el.addEventListener("change", render));
 
+  // ---- 手直しブラシ ----
+  const tool = () => radio("tool");
+  document.querySelectorAll('input[name="tool"]').forEach((el) => el.addEventListener("change", () => {
+    stage.classList.toggle("painting", tool() !== "none");
+    $("brushRow").hidden = tool() === "none";
+  }));
+  brushInput.addEventListener("input", () => { brushVal.textContent = brushInput.value; });
+
+  let painting = false, last = null;
+  const toSource = (e) => {
+    const rect = preview.getBoundingClientRect();
+    const k = preview.width / rect.width;
+    const cx = (e.clientX - rect.left) * k, cy = (e.clientY - rect.top) * k;
+    const { scale, offX, offY } = layout(preview.width);
+    return {
+      x: bounds.x + (cx - offX) / scale,
+      y: bounds.y + (cy - offY) / scale,
+      r: (Number(brushInput.value) / 2) * k / scale,
+    };
+  };
+
+  function stroke(a, b) {
+    const ctx = cutout.getContext("2d");
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    const steps = Math.max(1, Math.ceil(len / (b.r * 0.4)));
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+      const x = a.x + (b.x - a.x) * i / steps, y = a.y + (b.y - a.y) * i / steps;
+      ctx.moveTo(x + b.r, y);
+      ctx.arc(x, y, b.r, 0, Math.PI * 2);
+    }
+    if (tool() === "erase") {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fill();
+    } else {
+      ctx.clip();
+      ctx.clearRect(0, 0, cutout.width, cutout.height);
+      ctx.drawImage(original, 0, 0);
+    }
+    ctx.restore();
+    render();
+  }
+
+  preview.addEventListener("pointerdown", (e) => {
+    if (tool() === "none" || !cutout || busy) return;
+    e.preventDefault();
+    undoStack.push(cutout.getContext("2d").getImageData(0, 0, cutout.width, cutout.height));
+    if (undoStack.length > 15) undoStack.shift();
+    undoBtn.disabled = false;
+    painting = true;
+    preview.setPointerCapture(e.pointerId);
+    last = toSource(e);
+    stroke(last, last);
+  });
+  preview.addEventListener("pointermove", (e) => {
+    if (!painting) return;
+    const p = toSource(e);
+    stroke(last, p);
+    last = p;
+  });
+  const endStroke = () => { painting = false; last = null; };
+  preview.addEventListener("pointerup", endStroke);
+  preview.addEventListener("pointercancel", endStroke);
+
+  undoBtn.addEventListener("click", () => {
+    const snap = undoStack.pop();
+    if (snap) { cutout.getContext("2d").putImageData(snap, 0, 0); render(); }
+    undoBtn.disabled = undoStack.length === 0;
+  });
+
   // ---- 保存 ----
-  dlBtn.addEventListener("click", () => {
+  dlBtn.addEventListener("click", async () => {
     if (!cutout) return;
     const size = Number(radio("size"));
-    const c = document.createElement("canvas");
-    c.width = c.height = size;
+    const c = newCanvas(size, size);
     drawIcon(c, size);
-    c.toBlob((blob) => {
+    const save = (blob) => {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = `${baseName}_icon_${size}.png`;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    }, "image/png");
+    };
+    try {
+      save(await encodeWithMatte(c, $("matteColor").value));
+    } catch (err) {
+      console.warn("matte encode failed, fallback", err);
+      c.toBlob(save, "image/png");
+    }
   });
+
+  // ---- 透明部分の「下の色」を指定してPNGを書き出す ----
+  // ブラウザ標準の書き出しでは透明部分の色が必ず黒(0,0,0)になり、
+  // 透明度を無視するアプリでは黒背景に見えてしまうため、PNGを自前で組み立てる。
+  async function encodeWithMatte(canvas, hex) {
+    if (typeof CompressionStream === "undefined") throw new Error("CompressionStream unsupported");
+    const w = canvas.width, h = canvas.height;
+    const px = canvas.getContext("2d").getImageData(0, 0, w, h).data;
+    const mr = parseInt(hex.slice(1, 3), 16), mg = parseInt(hex.slice(3, 5), 16), mb = parseInt(hex.slice(5, 7), 16);
+
+    // 行ごとにフィルタ種別(0)＋RGBA
+    const raw = new Uint8Array((w * 4 + 1) * h);
+    for (let y = 0; y < h; y++) {
+      const ro = y * (w * 4 + 1);
+      raw[ro] = 0;
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4, o = ro + 1 + x * 4;
+        const a = px[i + 3];
+        if (a === 0) {
+          raw[o] = mr; raw[o + 1] = mg; raw[o + 2] = mb; raw[o + 3] = 0;
+        } else {
+          raw[o] = px[i]; raw[o + 1] = px[i + 1]; raw[o + 2] = px[i + 2]; raw[o + 3] = a;
+        }
+      }
+    }
+    const idat = new Uint8Array(await new Response(
+      new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate"))
+    ).arrayBuffer());
+
+    const ihdr = new Uint8Array(13);
+    const dv = new DataView(ihdr.buffer);
+    dv.setUint32(0, w); dv.setUint32(4, h);
+    ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0; // 8bit RGBA
+
+    const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    return new Blob([sig, chunk("IHDR", ihdr), chunk("IDAT", idat), chunk("IEND", new Uint8Array(0))], { type: "image/png" });
+  }
+
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+
+  function chunk(type, data) {
+    const out = new Uint8Array(12 + data.length);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(0, data.length);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(data, 8);
+    let c = 0xFFFFFFFF;
+    for (let i = 4; i < 8 + data.length; i++) c = CRC_TABLE[(c ^ out[i]) & 0xFF] ^ (c >>> 8);
+    dv.setUint32(8 + data.length, (c ^ 0xFFFFFFFF) >>> 0);
+    return out;
+  }
 
   render();
 </script>
